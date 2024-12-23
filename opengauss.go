@@ -23,16 +23,10 @@ type Dialector struct {
 type Config struct {
 	DriverName           string
 	DSN                  string
-	WithoutQuotingCheck  bool
 	PreferSimpleProtocol bool
 	WithoutReturning     bool
 	Conn                 gorm.ConnPool
 }
-
-var (
-	timeZoneMatcher         = regexp.MustCompile("(time_zone|TimeZone)=(.*?)($|&| )")
-	defaultIdentifierLength = 63 // maximum identifier length for postgres
-)
 
 func Open(dsn string) gorm.Dialector {
 	return &Dialector{&Config{DSN: dsn}}
@@ -46,41 +40,19 @@ func (dia Dialector) Name() string {
 	return "opengauss"
 }
 
-func (dia Dialector) Apply(config *gorm.Config) error {
-	if config.NamingStrategy == nil {
-		config.NamingStrategy = schema.NamingStrategy{
-			IdentifierMaxLength: defaultIdentifierLength,
-		}
-		return nil
-	}
-
-	switch v := config.NamingStrategy.(type) {
-	case *schema.NamingStrategy:
-		if v.IdentifierMaxLength <= 0 {
-			v.IdentifierMaxLength = defaultIdentifierLength
-		}
-	case schema.NamingStrategy:
-		if v.IdentifierMaxLength <= 0 {
-			v.IdentifierMaxLength = defaultIdentifierLength
-			config.NamingStrategy = v
-		}
-	}
-
-	return nil
-}
+var timeZoneMatcher = regexp.MustCompile("(time_zone|TimeZone)=(.*?)($|&| )")
 
 func (dia Dialector) Initialize(db *gorm.DB) (err error) {
+	if dia.DriverName == "" {
+		dia.DriverName = "opengauss"
+	}
+
 	callbackConfig := &callbacks.Config{
-		CreateClauses: []string{"INSERT", "VALUES", "ON CONFLICT"},
-		UpdateClauses: []string{"UPDATE", "SET", "FROM", "WHERE"},
-		DeleteClauses: []string{"DELETE", "FROM", "WHERE"},
+		CreateClauses: []string{"INSERT", "VALUES", "ON CONFLICT", "RETURNING"},
+		UpdateClauses: []string{"UPDATE", "SET", "FROM", "WHERE", "RETURNING"},
+		DeleteClauses: []string{"DELETE", "FROM", "WHERE", "RETURNING"},
 	}
 	// register callbacks
-	if !dia.WithoutReturning {
-		callbackConfig.CreateClauses = append(callbackConfig.CreateClauses, "RETURNING")
-		callbackConfig.UpdateClauses = append(callbackConfig.UpdateClauses, "RETURNING")
-		callbackConfig.DeleteClauses = append(callbackConfig.DeleteClauses, "RETURNING")
-	}
 	callbacks.RegisterDefaultCallbacks(db, callbackConfig)
 
 	if dia.Conn != nil {
@@ -88,7 +60,9 @@ func (dia Dialector) Initialize(db *gorm.DB) (err error) {
 	} else if dia.DriverName != "" {
 		db.ConnPool, err = sql.Open(dia.DriverName, dia.Config.DSN)
 	} else {
-		config, err := pq.ParseConfig(dia.Config.DSN)
+		// default use of driver openGauss-connector-go-pq
+		var config *pq.Config
+		config, err = pq.ParseConfig(dia.Config.DSN)
 		if err != nil {
 			return
 		}
@@ -99,8 +73,9 @@ func (dia Dialector) Initialize(db *gorm.DB) (err error) {
 
 		connector, _ := pq.NewConnectorConfig(config)
 		db.ConnPool = sql.OpenDB(connector)
+
 	}
-	for k, v := range dia.ClauseBuilders() {
+	for k, v := range dia.clauseBuilders() {
 		db.ClauseBuilders[k] = v
 	}
 
@@ -125,11 +100,6 @@ func (dia Dialector) BindVarTo(writer clause.Writer, stmt *gorm.Statement, v int
 }
 
 func (dia Dialector) QuoteTo(writer clause.Writer, str string) {
-	if dia.WithoutQuotingCheck {
-		writer.WriteString(str)
-		return
-	}
-
 	var (
 		underQuoted, selfQuoted bool
 		continuousBacktick      int8
@@ -267,9 +237,24 @@ func (dia Dialector) RollbackTo(tx *gorm.DB, name string) error {
 	return nil
 }
 
-func (dia Dialector) ClauseBuilders() map[string]clause.ClauseBuilder {
-	clauseBuilders := map[string]clause.ClauseBuilder{
-		"ON CONFLICT": func(c clause.Clause, builder clause.Builder) {
+func getSerialDatabaseType(s string) (dbType string, ok bool) {
+	switch s {
+	case "smallserial":
+		return "smallint", true
+	case "serial":
+		return "integer", true
+	case "bigserial":
+		return "bigint", true
+	default:
+		return "", false
+	}
+}
+
+func (Dialector) clauseBuilders() map[string]clause.ClauseBuilder {
+	const onConflictKey, returningKey = "ON CONFLICT", "RETURNING"
+
+	return map[string]clause.ClauseBuilder{
+		onConflictKey: func(c clause.Clause, builder clause.Builder) {
 			onConflict, _ := c.Expression.(clause.OnConflict)
 			stmt := builder.(*gorm.Statement)
 			s := stmt.Schema
@@ -314,15 +299,14 @@ func (dia Dialector) ClauseBuilders() map[string]clause.ClauseBuilder {
 				builder.WriteByte(' ')
 			}
 		},
-		"RETURNING": func(c clause.Clause, builder clause.Builder) {
+		returningKey: func(c clause.Clause, builder clause.Builder) {
 			// exist bath 'RETURNING' and 'ON CONFLICT', 'RETURNING' clauses is invalid
-			_, hasOnConflict := builder.(*gorm.Statement).Clauses["ON CONFLICT"]
+			_, hasOnConflict := builder.(*gorm.Statement).Clauses[onConflictKey]
 			if hasOnConflict {
 				return
 			}
 
 			returning, _ := c.Expression.(clause.Returning)
-
 			builder.WriteString("RETURNING ")
 			if len(returning.Columns) > 0 {
 				for idx, column := range returning.Columns {
@@ -336,20 +320,5 @@ func (dia Dialector) ClauseBuilders() map[string]clause.ClauseBuilder {
 				builder.WriteByte('*')
 			}
 		},
-	}
-
-	return clauseBuilders
-}
-
-func getSerialDatabaseType(s string) (dbType string, ok bool) {
-	switch s {
-	case "smallserial":
-		return "smallint", true
-	case "serial":
-		return "integer", true
-	case "bigserial":
-		return "bigint", true
-	default:
-		return "", false
 	}
 }
