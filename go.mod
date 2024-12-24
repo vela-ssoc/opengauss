@@ -1,4 +1,4 @@
-module github.com/ssoc/opengauss
+module github.com/vela-ssoc/opengauss
 
 go 1.18
 
