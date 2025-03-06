@@ -37,14 +37,14 @@ func New(config Config) gorm.Dialector {
 }
 
 func (dia Dialector) Name() string {
-	return "opengauss"
+	return dia.DriverName
 }
 
 var timeZoneMatcher = regexp.MustCompile("(time_zone|TimeZone)=(.*?)($|&| )")
 
 func (dia Dialector) Initialize(db *gorm.DB) (err error) {
 	if dia.DriverName == "" {
-		dia.DriverName = "opengauss"
+		dia.DriverName = "postgres"
 	}
 
 	callbackConfig := &callbacks.Config{
